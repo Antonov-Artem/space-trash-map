@@ -1,144 +1,153 @@
-from flask import Flask, jsonify, request, render_template
-from flask_cors import CORS
-from skyfield.api import load, EarthSatellite
-from datetime import datetime, timezone, timedelta
-import numpy as np
+import requests
 import sqlite3
+import os
+from flask import Flask, jsonify, request
+from skyfield.api import EarthSatellite, load
+from datetime import timedelta
+from flask_cors import CORS
 
-# --- Config ---
-DB_NAME = "debris.db"
 
-# --- Flask Setup ---
+# Источники TLE
+TLE_URLS = {
+    "debris": "https://celestrak.org/NORAD/elements/gp.php?GROUP=geo&FORMAT=TLE",
+    "satellite": "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=TLE"
+}
+
+DB_PATH = "debris.db"
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "https://space-trash-map.vercel.app"}})
 
-current_objects_data = []
-cached_tle_data = {}
-
-# --- DB Functions ---
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS debris (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             tle1 TEXT,
             tle2 TEXT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            is_satellite INTEGER
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-def load_debris_from_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT id, name, tle1, tle2 FROM debris")
-    data = c.fetchall()
+def insert_tle_data(name, line1, line2, is_satellite):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO debris (name, tle1, tle2, is_satellite)
+        VALUES (?, ?, ?, ?)
+    """, (name, line1, line2, is_satellite))
+    conn.commit()
     conn.close()
-    return data
 
-# --- TLE Processing ---
-def calculate_and_format_objects(debris_data):
+def fetch_and_store_group(group_name, url, max_count=20):
+    response = requests.get(url)
+    if response.status_code != 200:
+        print(f"❌ Ошибка загрузки {group_name}: {response.status_code}")
+        return 0, 0
+
+    lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+    inserted = 0
+    skipped = 0
+    i = 0
+
+    while i < len(lines) - 2 and inserted < max_count:
+        name = lines[i]
+        line1 = lines[i + 1]
+        line2 = lines[i + 2]
+
+        if line1.startswith("1 ") and line2.startswith("2 "):
+            try:
+                EarthSatellite(line1, line2, name)
+                insert_tle_data(name, line1, line2, int(group_name == "satellite"))
+                inserted += 1
+            except Exception:
+                skipped += 1
+            i += 3
+        else:
+            skipped += 1
+            i += 1
+
+    return inserted, skipped
+
+def reset_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DROP TABLE IF EXISTS debris")
+    conn.commit()
+    conn.close()
+    init_db()
+
+@app.route("/update", methods=["POST"])
+def update():
+    debris_count = int(request.form.get("debris", 10))
+    satellite_count = int(request.form.get("satellite", 10))
+
+    reset_database()
+    fetch_and_store_group("debris", TLE_URLS["debris"], max_count=debris_count)
+    fetch_and_store_group("satellite", TLE_URLS["satellite"], max_count=satellite_count)
+
+    return jsonify({"status": "ok"})
+
+@app.route("/api/objects")
+def api_objects():
+    limit = int(request.args.get("limit", 40))
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, tle1, tle2, is_satellite FROM debris LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
     ts = load.timescale()
-    now = ts.utc(datetime.now(timezone.utc))
+    now = ts.now()
+    result = []
 
-    formatted_objects = []
-    cached_tle_data.clear()
-
-    for obj_id, name, tle1, tle2 in debris_data:
+    for row in rows:
         try:
-            satellite = EarthSatellite(tle1, tle2, name, ts)
-            geocentric = satellite.at(now)
-            x, y, z = geocentric.position.km
+            sat = EarthSatellite(row[2], row[3], row[1], ts)
+            geocentric_now = sat.at(now)
+            position_now = geocentric_now.position.km
 
-            obj_type = "satellite" if any(keyword in name.upper() for keyword in
-                ["ISS", "STARLINK", "COSMOS", "SPUTNIK", "IRIDIUM", "INTELSAT", "GOES", "GPS", "GALILEO", "GLONASS"]) else "debris"
-
-            # Вычисляем орбиту на 90 точек вперёд (90 минут)
             orbit_points = []
-            for i in range(90):
-                t_future = ts.utc(datetime.utcnow() + timedelta(minutes=i))
-                pos = satellite.at(t_future).position.km
-                orbit_points.append([round(pos[0], 2), round(pos[1], 2), round(pos[2], 2)])
+            for minutes_ahead in range(0, 91, 10):
+                t = ts.utc(now.utc_datetime() + timedelta(minutes=minutes_ahead))
+                pos = sat.at(t).position.km
+                orbit_points.append([float(pos[0]), float(pos[1]), float(pos[2])])
 
-            space_object = {
-                "id": obj_id,
-                "name": name,
-                "description": f"{obj_type.capitalize()}: {name}",
+            obj_type = 'satellite' if row[4] else 'debris'
+
+            result.append({
+                "id": row[0],
+                "name": row[1],
                 "type": obj_type,
-                "position": [round(x, 2), round(y, 2), round(z, 2)],
+                "description": f"{obj_type.capitalize()}: {row[1]}",
+                "position": [float(position_now[0]), float(position_now[1]), float(position_now[2])],
                 "orbit": orbit_points
-            }
-
-            formatted_objects.append(space_object)
-            cached_tle_data[name] = (tle1, tle2, obj_type)
-
+            })
         except Exception as e:
-            print(f"[ERROR] Failed to process {name}: {e}")
+            print(f"⚠️ Ошибка орбиты: {row[1]} – {e}")
             continue
 
-    return formatted_objects
+    return jsonify(result)
 
-# --- API Routes ---
-@app.route('/api/objects', methods=['GET'])
-def get_objects():
-    obj_type = request.args.get('type')
-    if obj_type:
-        filtered = [obj for obj in current_objects_data if obj["type"] == obj_type]
-        return jsonify(filtered)
-    return jsonify(current_objects_data)
-
-@app.route('/api/object/<string:object_name>', methods=['GET'])
-def get_object_parameters(object_name):
-    tle_info = cached_tle_data.get(object_name)
-    if not tle_info:
-        return jsonify({"message": f"Object '{object_name}' not found."}), 404
-
-    tle1, tle2, object_type = tle_info
-    ts = load.timescale()
-    now = ts.utc(datetime.now(timezone.utc))
-
-    try:
-        satellite = EarthSatellite(tle1, tle2, object_name, ts)
-        geocentric = satellite.at(now)
-        subpoint = geocentric.subpoint()
-
-        x, y, z = geocentric.position.km
-        vx, vy, vz = geocentric.velocity.km_per_s
-        velocity_mag = np.linalg.norm(geocentric.velocity.km_per_s)
-        altitude_km = geocentric.distance().km - 6371.0
-
-        return jsonify({
-            "name": object_name,
-            "type": object_type,
-            "tle1": tle1,
-            "tle2": tle2,
-            "current_position_km": [round(x, 2), round(y, 2), round(z, 2)],
-            "velocity_km_s": [round(vx, 2), round(vy, 2), round(vz, 2), round(velocity_mag, 2)],
-            "altitude_km": round(altitude_km, 2),
-            "subpoint": {
-                "latitude_deg": round(subpoint.latitude.degrees, 2),
-                "longitude_deg": round(subpoint.longitude.degrees, 2)
-            }
-        })
-
-    except Exception as e:
-        return jsonify({"message": f"Calculation error: {e}"}), 500
-
-@app.route('/')
-def serve_frontend():
-    return render_template('index.html')
-
-# --- Main ---
-if __name__ == '__main__':
-    print("\U0001F6F8 Initializing Space Debris Tracker backend...")
+if __name__ == "__main__":
+    print("🚀 Starting Space Debris Tracker API...")
     init_db()
-    debris_data = load_debris_from_db()
-    if debris_data:
-        print(f"✅ Loaded {len(debris_data)} TLE entries from DB.")
-        current_objects_data = calculate_and_format_objects(debris_data)
-    else:
-        print("⚠️ No TLE data found in database.")
-    app.run(host='127.0.0.1', port=5000, debug=True)
+
+    # Проверка на пустую БД
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM debris")
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    if count == 0:
+        print("📡 Загружаем объекты...")
+        fetch_and_store_group("debris", TLE_URLS["debris"], max_count=20)
+        fetch_and_store_group("satellite", TLE_URLS["satellite"], max_count=20)
+
+    print("✅ Сервер готов к работе.")
+    app.run(host="0.0.0.0", port=5000, debug=True)
