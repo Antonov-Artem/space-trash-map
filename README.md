@@ -2,8 +2,6 @@
 
 **Space Trash Map** is your assistant in tracking and analyzing space debris that threatens satellites and research missions.
 
----
-
 ## 🚀 About project
 
 The millions of debris left in orbit pose a threat to active satellites and space missions.
@@ -15,16 +13,12 @@ The millions of debris left in orbit pose a threat to active satellites and spac
 - Provide analytics for satellite operators and researchers.
 - To promote international cooperation in the field of orbit clearance.
 
----
-
 ## ⚙️ Basic capabilities
 
 - Interactive map with real orbits.
 - Collision risk warning system.
 - Analysis of trends in waste collection.
 - API for integration with external services.
-
----
 
 ## 📦 Installation
 
